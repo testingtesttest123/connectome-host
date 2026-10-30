@@ -74,6 +74,12 @@ interface Opts {
   sessionName?: string;
   write: boolean;
   limit?: number;
+  /** How much of a tool interaction to keep. Measured on a real store: tool
+   *  result payloads are 43% of all characters and tool inputs another 20%,
+   *  while actual prose is 17%. 'stub' keeps the shape of the work (which tool,
+   *  ok or error, how much came back) and drops the payload; 'cap' truncates;
+   *  'full' keeps everything. */
+  toolPayload: 'stub' | 'cap' | 'full';
   /** Chunk target for the strategy opened at import time. Warmup's cost scales
    *  with chunk COUNT, so the size chosen here is the size the whole history
    *  gets remembered at. Null = leave the store unchunked for a later open. */
@@ -94,6 +100,9 @@ function usage(): never {
       '  --out <dir>           DATA_DIR for the chronicle (default: $DATA_DIR or ./data)',
       '  --session-name <name> session title (default: derived from the source dir)',
       '  --limit <n>           import at most n path messages (for rehearsals)',
+      '  --tool-payload <mode>      stub (default) | cap | full — how much tool',
+      '                     output to keep. Results are 43% of a real history by',
+      '                     volume and inputs 20%, against 17% of actual prose.',
       '  --target-chunk-tokens <n>  chunk size for the strategy opened here',
       '                     (cost of a later warmup scales with chunk COUNT)',
       '  --write               actually write; without it this is a dry run',
@@ -111,6 +120,7 @@ function parseArgs(argv: string[]): Opts {
   const agentName = get('--agent-name') ?? usage();
   const limitRaw = get('--limit');
   const targetRaw = get('--target-chunk-tokens');
+  const payloadRaw = (get('--tool-payload') ?? 'stub') as Opts['toolPayload'];
   return {
     store,
     agentName,
@@ -120,6 +130,7 @@ function parseArgs(argv: string[]): Opts {
     write: argv.includes('--write'),
     limit: limitRaw ? Number(limitRaw) : undefined,
     targetChunkTokens: targetRaw ? Number(targetRaw) : null,
+    toolPayload: ['stub', 'cap', 'full'].includes(payloadRaw) ? payloadRaw : 'stub',
   };
 }
 
@@ -251,7 +262,28 @@ export interface TransformResult {
  * already stores them as separate rows, so this is a straight mapping rather
  * than the splitting the claude.ai importer needs.
  */
-export function transformRow(row: LettaRow): TransformResult {
+export interface PayloadPolicy {
+  mode: 'stub' | 'cap' | 'full';
+  /** Characters kept per tool result / tool input when mode is 'cap'. */
+  cap?: number;
+}
+
+const FULL_PAYLOAD: PayloadPolicy = { mode: 'full' };
+
+function shorten(text: string, policy: PayloadPolicy, kind: 'result' | 'input', name: string, isError = false): string {
+  if (policy.mode === 'full') return text;
+  const cap = policy.cap ?? 2000;
+  if (policy.mode === 'stub') {
+    // Keep the shape of the work, not the payload: a later reader can still
+    // see that a tool ran, whether it failed, and how much it returned.
+    const label = kind === 'result' ? 'result' : 'input';
+    const status = kind === 'result' ? (isError ? ', error' : ', ok') : '';
+    return `[tool ${label} omitted: ${name}, ${text.length} chars${status}]`;
+  }
+  return text.length <= cap ? text : `${text.slice(0, cap)}\n…[truncated ${text.length - cap} chars]`;
+}
+
+export function transformRow(row: LettaRow, policy: PayloadPolicy = FULL_PAYLOAD): TransformResult {
   const body = row.message ?? {};
   const content = body.content;
   const omitted: string[] = [];
@@ -264,7 +296,7 @@ export function transformRow(row: LettaRow): TransformResult {
         {
           type: 'tool_result',
           tool_use_id: toolUseId,
-          content: blockText(content),
+          content: shorten(blockText(content), policy, 'result', body.toolName ?? 'tool', body.isError === true),
           ...(body.isError ? { is_error: true } : {}),
         } as ContentBlock,
       ],
@@ -292,11 +324,16 @@ export function transformRow(row: LettaRow): TransformResult {
       case 'toolCall': {
         const call = b as LettaToolCallBlock;
         if (!call.name) { omitted.push('tool_call_without_name'); break; }
+        // Tool inputs carry real authored text (a memory edit, a written
+        // journal), so 'stub' compresses them rather than deleting them.
+        const args = JSON.stringify(call.arguments ?? {});
+        const kept = policy.mode === 'full' ? call.arguments ?? {}
+          : { _imported: shorten(args, { ...policy, mode: policy.mode === 'stub' ? 'cap' : policy.mode, cap: policy.cap ?? 500 }, 'input', call.name) };
         blocks.push({
           type: 'tool_use',
           id: call.id || `toolu_imported_${row.id}`,
           name: call.name,
-          input: call.arguments ?? {},
+          input: kept,
         } as ContentBlock);
         break;
       }
@@ -330,12 +367,13 @@ async function main(): Promise<void> {
 
   // Tally before writing: this is the "print the speaker tally" step the
   // runbook asks a human to eyeball.
+  const policy: PayloadPolicy = { mode: opts.toolPayload };
   const tally = new Map<string, number>();
   const blockTally = new Map<string, number>();
   const omittedTally = new Map<string, number>();
   let empty = 0;
   for (const row of selected) {
-    const { blocks, omitted } = transformRow(row);
+    const { blocks, omitted } = transformRow(row, policy);
     if (blocks.length === 0) { empty++; continue; }
     tally.set(participantFor(row, opts), (tally.get(participantFor(row, opts)) ?? 0) + 1);
     for (const b of blocks) blockTally.set((b as { type: string }).type, (blockTally.get((b as { type: string }).type) ?? 0) + 1);
@@ -348,6 +386,7 @@ async function main(): Promise<void> {
   console.log(`[import] rows:        ${rows.length} (messages ${rows.filter((r) => r.type === 'message').length}, compactions ${compactions}, session ${sessions})`);
   console.log(`[import] path:        ${path.length} messages (dropped ${stats.droppedMessages} on other branches)`);
   console.log(`[import] branches:    ${stats.leaves} leaves, ${stats.parentsWithMultipleChildren} parents with >1 child`);
+  console.log(`[import] tool payload: ${opts.toolPayload}`);
   console.log(`[import] chunk target: ${opts.targetChunkTokens ?? 4096} (sharding on; sticky after this import)`);
   console.log(`[import] importing:   ${selected.length} messages${opts.limit ? ` (--limit ${opts.limit})` : ''}, ${empty} degenerate skipped`);
   console.log(`[import] span:        ${first ?? '?'} .. ${last ?? '?'}`);
@@ -388,7 +427,7 @@ async function main(): Promise<void> {
     });
     try {
       for (const row of selected) {
-        const { blocks } = transformRow(row);
+        const { blocks } = transformRow(row, policy);
         if (blocks.length === 0) continue;
         cm.addMessage(participantFor(row, opts), blocks, {
           sourceId: row.id,
@@ -423,6 +462,7 @@ async function main(): Promise<void> {
         speakerTally: Object.fromEntries(tally),
         blockTally: Object.fromEntries(blockTally),
         omitted: Object.fromEntries(omittedTally),
+        toolPayload: opts.toolPayload,
         limit: opts.limit ?? null,
         importedAt: new Date().toISOString(),
       },

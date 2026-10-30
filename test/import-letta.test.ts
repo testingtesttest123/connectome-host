@@ -71,6 +71,60 @@ describe('linearize', () => {
   });
 });
 
+describe('transformRow — tool payload policy', () => {
+  const bigResult: Row = {
+    type: 'message',
+    id: 'r9',
+    parentId: null,
+    timestamp: '2026-01-01T00:00:00Z',
+    message: {
+      role: 'toolResult',
+      toolCallId: 'tool_big',
+      toolName: 'Bash',
+      content: [{ type: 'text', text: 'x'.repeat(50_000) }],
+    },
+  };
+
+  test('stub keeps the shape of the work and drops the payload', () => {
+    const { blocks } = transformRow(bigResult, { mode: 'stub' });
+    const text = (blocks[0] as { content: string }).content;
+    expect(text.length).toBeLessThan(120);
+    expect(text).toContain('Bash');
+    expect(text).toContain('50000 chars');
+    expect(text).toContain('ok');
+  });
+
+  test('stub still marks a failed result as an error', () => {
+    const failed = { ...bigResult, message: { ...bigResult.message, isError: true } };
+    const { blocks } = transformRow(failed as Row, { mode: 'stub' });
+    expect((blocks[0] as { content: string }).content).toContain('error');
+    expect((blocks[0] as { is_error?: boolean }).is_error).toBe(true);
+  });
+
+  test('full keeps the payload intact', () => {
+    const { blocks } = transformRow(bigResult, { mode: 'full' });
+    expect((blocks[0] as { content: string }).content.length).toBe(50_000);
+  });
+
+  test('stub compresses a tool input instead of deleting it', () => {
+    const row: Row = {
+      type: 'message',
+      id: 'a9',
+      parentId: null,
+      timestamp: '2026-01-01T00:00:00Z',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'toolCall', id: 't1', name: 'memory', arguments: { command: 'create', content: 'y'.repeat(9000) } }],
+      },
+    };
+    const { blocks } = transformRow(row, { mode: 'stub' });
+    const input = (blocks[0] as { input: Record<string, unknown> }).input;
+    expect(typeof input._imported).toBe('string');
+    expect((input._imported as string).length).toBeLessThan(700);
+    expect(input._imported as string).toContain('truncated');
+  });
+});
+
 describe('transformRow', () => {
   test('a toolResult row becomes a tool_result block on the non-assistant side', () => {
     const row: Row = {
