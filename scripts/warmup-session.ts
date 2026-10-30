@@ -38,7 +38,8 @@
  *   --merge-threshold <n>  L1→L2 / L2→L3 merge threshold (default: 6)
  */
 
-import { resolve } from 'node:path';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager } from '@animalabs/context-manager';
 import { AutobiographicalStrategy } from '@animalabs/agent-framework';
@@ -195,6 +196,28 @@ function formatDuration(sec: number): string {
 }
 
 // ---------------------------------------------------------------------------
+// Chunk-target marker (beside the session, never inside the store)
+// ---------------------------------------------------------------------------
+
+function readTargetMarker(path: string): number | null {
+  try {
+    const raw = readFileSync(path, 'utf8');
+    const parsed = JSON.parse(raw) as { targetChunkTokens?: number };
+    return typeof parsed.targetChunkTokens === 'number' ? parsed.targetChunkTokens : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeTargetMarker(path: string, target: number): void {
+  try {
+    writeFileSync(path, JSON.stringify({ targetChunkTokens: target }) + '\n');
+  } catch (e) {
+    console.error(`[warmup] could not record the chunk target beside the store: ${String(e)}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -318,18 +341,49 @@ async function main() {
     namespace: `agents/${agentName}`,
   });
 
+  // Compression refuses to run when a chunk contains tool blocks and the host
+  // has pushed no tool definitions ("deferring chunk compression: host has not
+  // provided tool definitions yet"). A warm-runner has no live toolset, so
+  // synthesise the names actually present in the history — the summarizer then
+  // reads the same tool vocabulary the transcript uses.
+  const toolNames = new Set<string>();
+  for (const m of cm.getAllMessages()) {
+    for (const b of (m.content ?? []) as Array<{ type?: string; name?: string }>) {
+      if (b.type === 'tool_use' && typeof b.name === 'string') toolNames.add(b.name);
+    }
+  }
+  if (toolNames.size > 0) {
+    cm.setToolDefinitions(
+      [...toolNames].map((name) => ({
+        name,
+        description: `Tool referenced in the imported history (${name}).`,
+        inputSchema: { type: 'object' as const, properties: {}, required: [] },
+      })),
+    );
+    console.error(`Tools: ${toolNames.size} definitions synthesised from the history`);
+  }
+
   // -- Inspect initial state --
   const initialStats = strategy.getProgressSnapshot();
   // A chunk size can only be chosen before the store is compressed: boundaries
   // are created on first open and are sticky, so a mismatched target would be
   // silently ignored — the cheapest-looking way to bill at the expensive rate.
-  if (opts.targetChunkTokens !== null && initialStats.chunksCompressed > 0) {
+  // The store records the target it was first opened with, beside the session.
+  // Comparing against the request is the only way to tell a legitimate RESUME
+  // (same target, more work to do) from a silently-ignored change of size —
+  // refusing on "compressed chunks exist" alone blocked every resume.
+  const targetMarkerPath = join(storePath, '..', `${session.id}.chunk-target.json`);
+  const storedTarget = readTargetMarker(targetMarkerPath);
+  if (opts.targetChunkTokens !== null && storedTarget !== null && storedTarget !== opts.targetChunkTokens) {
     console.error(
-      `Refusing to warm: this store already has ${initialStats.chunksCompressed} compressed chunks, ` +
-      `so a new --target-chunk-tokens (${opts.targetChunkTokens}) would be silently ignored. ` +
+      `Refusing to warm: this store was chunked at ${storedTarget} tokens and chunk boundaries are ` +
+      `sticky, so --target-chunk-tokens ${opts.targetChunkTokens} would be silently ignored. ` +
       `Re-import into a fresh directory to change the granularity.`,
     );
     process.exit(3);
+  }
+  if (storedTarget === null && initialStats.chunksCompressed === 0 && opts.targetChunkTokens !== null) {
+    writeTargetMarker(targetMarkerPath, opts.targetChunkTokens);
   }
   const totalMessages = cm.getAllMessages().length;
   console.error(
@@ -389,6 +443,18 @@ async function main() {
     console.error(
       `Stopped with work remaining (L1=${finalStats.l1QueueLength}, merges=${finalStats.mergeQueueLength}). Re-run to continue.`,
     );
+  }
+
+  // "Converged" with nothing produced is a false green: the strategy defers
+  // every chunk when it lacks tool definitions, then reports an empty queue.
+  // A caller (especially a supervisor loop) must not read that as success.
+  const produced = finalStats.summaryCounts.l1 + finalStats.summaryCounts.l2 + finalStats.summaryCounts.l3;
+  if (produced === 0 && totalMessages > 0) {
+    console.error(
+      `ERROR: converged with ZERO summaries over ${totalMessages} messages — ` +
+      `compression was deferred, not completed. Check the tool-definition and provider warnings above.`,
+    );
+    process.exit(4);
   }
 
   store.close?.();
