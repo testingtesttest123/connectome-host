@@ -42,7 +42,7 @@ import { resolve } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager } from '@animalabs/context-manager';
 import { AutobiographicalStrategy } from '@animalabs/agent-framework';
-import { Membrane, AnthropicAdapter, BedrockAdapter, type NormalizedResponse } from '@animalabs/membrane';
+import { Membrane, AnthropicAdapter, BedrockAdapter, OpenAICompatibleAdapter, type NormalizedResponse } from '@animalabs/membrane';
 import { SessionManager } from '../src/session-manager.js';
 import { resolveAgentName } from '../src/agent-name.js';
 
@@ -59,6 +59,9 @@ const PRICING: Record<string, { input: number; output: number }> = {
   'claude-sonnet-4-5-20250929': { input: 3.0, output: 15.0 },
   'claude-opus-4-7': { input: 15.0, output: 75.0 },
   'claude-haiku-4-5-20251001': { input: 0.8, output: 4.0 },
+  // DeepSeek v4.1 flash via a reseller gateway (commandcode). These are the
+  // underlying API rates the gateway pass-throughs, not a marked-up price.
+  'deepseek/deepseek-v4.1-flash': { input: 0.28, output: 0.42 },
 };
 
 function priceOf(model: string): { input: number; output: number } {
@@ -82,6 +85,16 @@ interface Opts {
    */
   agentName?: string;
   maxSpend: number | null;
+  /** 'anthropic' (default), 'bedrock', or 'openai-compatible'. Inferred from
+   *  the model id when omitted, so existing invocations are unchanged. */
+  provider: 'anthropic' | 'bedrock' | 'openai-compatible';
+  /** Base URL for the openai-compatible provider (required for that mode). */
+  baseUrl: string | null;
+  /** Chunk size for autobiographical compression. Costs scale with the number
+   *  of chunks, not their size: each compression call re-reads the carried
+   *  summary archive, so ~4k chunks cost ~4x what ~16k chunks do. Set at the
+   *  first strategy open — chunk boundaries are computed then, not at import. */
+  targetChunkTokens: number | null;
   l1Budget?: number;
   l2Budget?: number;
   l3Budget?: number;
@@ -101,6 +114,9 @@ function parseArgs(argv: string[]): Opts {
     dataDir: resolve(process.cwd(), 'data'),
     model: 'claude-sonnet-4-5-20250929',
     maxSpend: null,
+    provider: 'anthropic',
+    baseUrl: null,
+    targetChunkTokens: null,
   };
   for (let i = 1; i < args.length; i++) {
     const a = args[i]!;
@@ -108,6 +124,9 @@ function parseArgs(argv: string[]): Opts {
     else if (a === '--model') opts.model = args[++i]!;
     else if (a === '--agent') opts.agentName = args[++i]!;
     else if (a === '--max-spend') opts.maxSpend = parseFloat(args[++i]!);
+    else if (a === '--provider') opts.provider = args[++i] as Opts['provider'];
+    else if (a === '--base-url') opts.baseUrl = args[++i]!;
+    else if (a === '--target-chunk-tokens') opts.targetChunkTokens = parseInt(args[++i]!, 10);
     else if (a === '--l1-budget') opts.l1Budget = parseInt(args[++i]!);
     else if (a === '--l2-budget') opts.l2Budget = parseInt(args[++i]!);
     else if (a === '--l3-budget') opts.l3Budget = parseInt(args[++i]!);
@@ -181,10 +200,25 @@ function formatDuration(sec: number): string {
 
 async function main() {
   const opts = parseArgs(process.argv);
+  // Provider resolution: explicit flag wins; otherwise infer from the model id
+  // so every existing invocation keeps its meaning.
   const bedrockModel = /^([a-z]{2,6}\.)?anthropic\./.test(opts.model);
-  if (bedrockModel) {
+  const provider = opts.provider !== 'anthropic'
+    ? opts.provider
+    : bedrockModel
+      ? 'bedrock'
+      : 'anthropic';
+  const baseUrl = opts.baseUrl ?? process.env.OPENAI_COMPATIBLE_BASE_URL ?? null;
+
+  if (provider === 'bedrock') {
     if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
       console.error('Bedrock model id — set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (and AWS_REGION)');
+      process.exit(1);
+    }
+  } else if (provider === 'openai-compatible') {
+    // A local server legitimately has no key, so only the endpoint is required.
+    if (!baseUrl) {
+      console.error('openai-compatible provider — pass --base-url or set OPENAI_COMPATIBLE_BASE_URL');
       process.exit(1);
     }
   } else if (!process.env.ANTHROPIC_API_KEY) {
@@ -218,7 +252,7 @@ async function main() {
     );
   }
   const agentName = resolved.name;
-  console.error(`Model: ${opts.model}`);
+  console.error(`Model: ${opts.model} (provider ${provider}${baseUrl ? ` @ ${baseUrl}` : ''})`);
   if (opts.maxSpend !== null) console.error(`Max spend: $${opts.maxSpend.toFixed(2)}`);
 
   // -- Membrane with token-spend hook --
@@ -228,10 +262,16 @@ async function main() {
   // BedrockAdapter with AWS_* env creds — legacy Claude models (revival
   // sessions) exist nowhere else. Caching off: legacy models reject
   // cache_control outright.
-  const isBedrock = /^([a-z]{2,6}\.)?anthropic\./.test(opts.model);
-  const adapter = isBedrock
+  const isBedrock = provider === 'bedrock';
+  const adapter = provider === 'bedrock'
     ? new BedrockAdapter()
-    : new AnthropicAdapter({ apiKey: process.env.ANTHROPIC_API_KEY });
+    : provider === 'openai-compatible'
+      ? new OpenAICompatibleAdapter({
+          baseURL: baseUrl!,
+          apiKey: process.env.OPENAI_COMPATIBLE_API_KEY || undefined,
+          providerName: 'openai-compatible',
+        })
+      : new AnthropicAdapter({ apiKey: process.env.ANTHROPIC_API_KEY });
   const membrane = new Membrane(adapter, {
     ...(isBedrock ? { defaultPromptCaching: false } : {}),
     // Imported sessions store assistant turns under participant `agentName`.
@@ -262,6 +302,7 @@ async function main() {
     // conversation under a single participant.
     summaryParticipant: agentName,
     autoTickOnNewMessage: false, // we drive ticks manually
+    ...(opts.targetChunkTokens !== null && { targetChunkTokens: opts.targetChunkTokens }),
     ...(opts.l1Budget !== undefined && { l1BudgetTokens: opts.l1Budget }),
     ...(opts.l2Budget !== undefined && { l2BudgetTokens: opts.l2Budget }),
     ...(opts.l3Budget !== undefined && { l3BudgetTokens: opts.l3Budget }),
