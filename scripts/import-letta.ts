@@ -28,6 +28,7 @@
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 import { ContextManager } from '@animalabs/context-manager';
+import { AutobiographicalStrategy } from '@animalabs/agent-framework';
 import type { ContentBlock } from '@animalabs/membrane';
 import { JsStore } from '@animalabs/chronicle';
 import { SessionManager } from '../src/session-manager.js';
@@ -73,6 +74,10 @@ interface Opts {
   sessionName?: string;
   write: boolean;
   limit?: number;
+  /** Chunk target for the strategy opened at import time. Warmup's cost scales
+   *  with chunk COUNT, so the size chosen here is the size the whole history
+   *  gets remembered at. Null = leave the store unchunked for a later open. */
+  targetChunkTokens: number | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -89,6 +94,8 @@ function usage(): never {
       '  --out <dir>           DATA_DIR for the chronicle (default: $DATA_DIR or ./data)',
       '  --session-name <name> session title (default: derived from the source dir)',
       '  --limit <n>           import at most n path messages (for rehearsals)',
+      '  --target-chunk-tokens <n>  chunk size for the strategy opened here',
+      '                     (cost of a later warmup scales with chunk COUNT)',
       '  --write               actually write; without it this is a dry run',
     ].join('\n'),
   );
@@ -103,6 +110,7 @@ function parseArgs(argv: string[]): Opts {
   const store = get('--store') ?? usage();
   const agentName = get('--agent-name') ?? usage();
   const limitRaw = get('--limit');
+  const targetRaw = get('--target-chunk-tokens');
   return {
     store,
     agentName,
@@ -111,6 +119,7 @@ function parseArgs(argv: string[]): Opts {
     sessionName: get('--session-name'),
     write: argv.includes('--write'),
     limit: limitRaw ? Number(limitRaw) : undefined,
+    targetChunkTokens: targetRaw ? Number(targetRaw) : null,
   };
 }
 
@@ -357,7 +366,22 @@ async function main(): Promise<void> {
   const outStorePath = sessionMgr.getStorePath(meta.id);
   const store = JsStore.openOrCreate({ path: outStorePath });
   try {
-    const cm = await ContextManager.open({ store });
+    // Chunk boundaries are created on the first strategy-backed open and are
+    // sticky afterwards, so if a size is requested it must be applied HERE —
+    // a later warmup cannot change it. Left null, the store stays unchunked
+    // and the warmup's own target governs.
+    const strategy = opts.targetChunkTokens !== null
+      ? new AutobiographicalStrategy({
+          compressionModel: 'unused-at-import',
+          summaryParticipant: opts.agentName,
+          autoTickOnNewMessage: false,
+          targetChunkTokens: opts.targetChunkTokens,
+        })
+      : undefined;
+    const cm = await ContextManager.open({
+      store,
+      ...(strategy ? { strategy: strategy as unknown as never, namespace: `agents/${opts.agentName}` } : {}),
+    });
     try {
       for (const row of selected) {
         const { blocks } = transformRow(row);

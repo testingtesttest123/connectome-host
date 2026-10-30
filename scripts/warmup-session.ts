@@ -320,6 +320,17 @@ async function main() {
 
   // -- Inspect initial state --
   const initialStats = strategy.getProgressSnapshot();
+  // A chunk size can only be chosen before the store is compressed: boundaries
+  // are created on first open and are sticky, so a mismatched target would be
+  // silently ignored — the cheapest-looking way to bill at the expensive rate.
+  if (opts.targetChunkTokens !== null && initialStats.chunksCompressed > 0) {
+    console.error(
+      `Refusing to warm: this store already has ${initialStats.chunksCompressed} compressed chunks, ` +
+      `so a new --target-chunk-tokens (${opts.targetChunkTokens}) would be silently ignored. ` +
+      `Re-import into a fresh directory to change the granularity.`,
+    );
+    process.exit(3);
+  }
   const totalMessages = cm.getAllMessages().length;
   console.error(
     `\nInitial state: ${totalMessages} messages, ${initialStats.totalChunks} chunks total ` +
