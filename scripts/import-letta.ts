@@ -348,6 +348,7 @@ async function main(): Promise<void> {
   console.log(`[import] rows:        ${rows.length} (messages ${rows.filter((r) => r.type === 'message').length}, compactions ${compactions}, session ${sessions})`);
   console.log(`[import] path:        ${path.length} messages (dropped ${stats.droppedMessages} on other branches)`);
   console.log(`[import] branches:    ${stats.leaves} leaves, ${stats.parentsWithMultipleChildren} parents with >1 child`);
+  console.log(`[import] chunk target: ${opts.targetChunkTokens ?? 4096} (sharding on; sticky after this import)`);
   console.log(`[import] importing:   ${selected.length} messages${opts.limit ? ` (--limit ${opts.limit})` : ''}, ${empty} degenerate skipped`);
   console.log(`[import] span:        ${first ?? '?'} .. ${last ?? '?'}`);
   console.log(`[import] speakers:    ${[...tally.entries()].map(([k, v]) => `${k}=${v}`).join(', ')}`);
@@ -366,21 +367,24 @@ async function main(): Promise<void> {
   const outStorePath = sessionMgr.getStorePath(meta.id);
   const store = JsStore.openOrCreate({ path: outStorePath });
   try {
-    // Chunk boundaries are created on the first strategy-backed open and are
-    // sticky afterwards, so if a size is requested it must be applied HERE —
-    // a later warmup cannot change it. Left null, the store stays unchunked
-    // and the warmup's own target governs.
-    const strategy = opts.targetChunkTokens !== null
-      ? new AutobiographicalStrategy({
-          compressionModel: 'unused-at-import',
-          summaryParticipant: opts.agentName,
-          autoTickOnNewMessage: false,
-          targetChunkTokens: opts.targetChunkTokens,
-        })
-      : undefined;
+    // ALWAYS open with the strategy, never without. Two reasons, both measured:
+    //   1. `chunkIngressMessage` only runs when a strategy is configured, and it
+    //      is what shards oversized messages at ingest. Without it a 528k-char
+    //      tool result lands as ONE unfoldable block (763 messages in a real
+    //      store exceed 20k chars) — the trap AGENT-ONBOARDING §6 names.
+    //   2. Chunk boundaries are created at the first strategy-backed open and
+    //      are sticky after, so the target chosen here cannot be changed later.
+    const strategy = new AutobiographicalStrategy({
+      compressionModel: 'unused-at-import',
+      summaryParticipant: opts.agentName,
+      autoTickOnNewMessage: false,
+      adaptiveResolution: true,
+      targetChunkTokens: opts.targetChunkTokens ?? 4096,
+    });
     const cm = await ContextManager.open({
       store,
-      ...(strategy ? { strategy: strategy as unknown as never, namespace: `agents/${opts.agentName}` } : {}),
+      strategy: strategy as unknown as never,
+      namespace: `agents/${opts.agentName}`,
     });
     try {
       for (const row of selected) {
