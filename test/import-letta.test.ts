@@ -141,7 +141,7 @@ describe('transformRow', () => {
     };
     const { blocks } = transformRow(row);
     expect(blocks).toEqual([
-      { type: 'tool_result', tool_use_id: 'tool_abc', content: 'boom', is_error: true },
+      { type: 'tool_result', toolUseId: 'tool_abc', content: 'boom', is_error: true },
     ]);
   });
 

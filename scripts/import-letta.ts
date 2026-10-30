@@ -120,7 +120,14 @@ function parseArgs(argv: string[]): Opts {
   const agentName = get('--agent-name') ?? usage();
   const limitRaw = get('--limit');
   const targetRaw = get('--target-chunk-tokens');
-  const payloadRaw = (get('--tool-payload') ?? 'stub') as Opts['toolPayload'];
+  const payloadRaw = get('--tool-payload') ?? 'stub';
+  // An unrecognised value must fail loudly: silently falling back to 'stub'
+  // would run a mode the operator did not choose (and, for 'full', silently
+  // discard the receipts they explicitly asked for).
+  if (!['stub', 'cap', 'full'].includes(payloadRaw)) {
+    console.error(`--tool-payload must be one of: stub, cap, full (got ${JSON.stringify(payloadRaw)})`);
+    process.exit(2);
+  }
   return {
     store,
     agentName,
@@ -130,7 +137,7 @@ function parseArgs(argv: string[]): Opts {
     write: argv.includes('--write'),
     limit: limitRaw ? Number(limitRaw) : undefined,
     targetChunkTokens: targetRaw ? Number(targetRaw) : null,
-    toolPayload: ['stub', 'cap', 'full'].includes(payloadRaw) ? payloadRaw : 'stub',
+    toolPayload: payloadRaw as Opts['toolPayload'],
   };
 }
 
@@ -253,6 +260,10 @@ function blockText(blocks: LettaBlock[] | string | null | undefined): string {
 export interface TransformResult {
   blocks: ContentBlock[];
   omitted: string[];
+  /** Measured payload shrinkage for this row, so the sidecar can record the
+   *  EFFECT of the policy rather than only the mode that was requested. */
+  toolCharsBefore?: number;
+  toolCharsAfter?: number;
 }
 
 /**
@@ -291,20 +302,30 @@ export function transformRow(row: LettaRow, policy: PayloadPolicy = FULL_PAYLOAD
   if (body.role === 'toolResult') {
     const toolUseId = body.toolCallId ?? '';
     if (!toolUseId) return { blocks: [], omitted: ['tool_result_without_call_id'] };
+    const before = blockText(content);
+    const after = shorten(before, policy, 'result', body.toolName ?? 'tool', body.isError === true);
     return {
       blocks: [
         {
           type: 'tool_result',
-          tool_use_id: toolUseId,
-          content: shorten(blockText(content), policy, 'result', body.toolName ?? 'tool', body.isError === true),
+          // Membrane's ToolResultContent is camelCase `toolUseId`. The providers
+          // tolerate the snake_case alias, but context-manager's tool-message
+          // normalizer reads ONLY `toolUseId` — so emitting snake_case silently
+          // breaks use/result pairing at compile time.
+          toolUseId,
+          content: after,
           ...(body.isError ? { is_error: true } : {}),
         } as ContentBlock,
       ],
       omitted,
+      toolCharsBefore: before.length,
+      toolCharsAfter: after.length,
     };
   }
 
   const blocks: ContentBlock[] = [];
+  let toolBefore = 0;
+  let toolAfter = 0;
   for (const b of Array.isArray(content) ? content : []) {
     switch (b.type) {
       case 'text': {
@@ -335,6 +356,8 @@ export function transformRow(row: LettaRow, policy: PayloadPolicy = FULL_PAYLOAD
           name: call.name,
           input: kept,
         } as ContentBlock);
+        toolBefore += args.length;
+        toolAfter += JSON.stringify(kept).length;
         break;
       }
       default:
@@ -342,7 +365,7 @@ export function transformRow(row: LettaRow, policy: PayloadPolicy = FULL_PAYLOAD
     }
   }
   if (typeof content === 'string' && content.length > 0) blocks.push({ type: 'text', text: content });
-  return { blocks, omitted };
+  return { blocks, omitted, toolCharsBefore: toolBefore, toolCharsAfter: toolAfter };
 }
 
 function participantFor(row: LettaRow, opts: Opts): string {
@@ -368,12 +391,16 @@ async function main(): Promise<void> {
   // Tally before writing: this is the "print the speaker tally" step the
   // runbook asks a human to eyeball.
   const policy: PayloadPolicy = { mode: opts.toolPayload };
+  let toolCharsBefore = 0;
+  let toolCharsAfter = 0;
   const tally = new Map<string, number>();
   const blockTally = new Map<string, number>();
   const omittedTally = new Map<string, number>();
   let empty = 0;
   for (const row of selected) {
-    const { blocks, omitted } = transformRow(row, policy);
+    const { blocks, omitted, toolCharsBefore: tb, toolCharsAfter: ta } = transformRow(row, policy);
+    toolCharsBefore += tb ?? 0;
+    toolCharsAfter += ta ?? 0;
     if (blocks.length === 0) { empty++; continue; }
     tally.set(participantFor(row, opts), (tally.get(participantFor(row, opts)) ?? 0) + 1);
     for (const b of blocks) blockTally.set((b as { type: string }).type, (blockTally.get((b as { type: string }).type) ?? 0) + 1);
@@ -386,7 +413,13 @@ async function main(): Promise<void> {
   console.log(`[import] rows:        ${rows.length} (messages ${rows.filter((r) => r.type === 'message').length}, compactions ${compactions}, session ${sessions})`);
   console.log(`[import] path:        ${path.length} messages (dropped ${stats.droppedMessages} on other branches)`);
   console.log(`[import] branches:    ${stats.leaves} leaves, ${stats.parentsWithMultipleChildren} parents with >1 child`);
-  console.log(`[import] tool payload: ${opts.toolPayload}`);
+  console.log(
+    `[import] tool payload: ${opts.toolPayload}` +
+      (toolCharsBefore > 0
+        ? ` (measured: ${toolCharsBefore} -> ${toolCharsAfter} chars, ` +
+          `${Math.round((1 - toolCharsAfter / toolCharsBefore) * 100)}% smaller)`
+        : ''),
+  );
   console.log(`[import] chunk target: ${opts.targetChunkTokens ?? 4096} (sharding on; sticky after this import)`);
   console.log(`[import] importing:   ${selected.length} messages${opts.limit ? ` (--limit ${opts.limit})` : ''}, ${empty} degenerate skipped`);
   console.log(`[import] span:        ${first ?? '?'} .. ${last ?? '?'}`);
@@ -463,6 +496,13 @@ async function main(): Promise<void> {
         blockTally: Object.fromEntries(blockTally),
         omitted: Object.fromEntries(omittedTally),
         toolPayload: opts.toolPayload,
+        toolPayloadEffect: {
+          toolCharsBefore,
+          toolCharsAfter,
+          reductionPct: toolCharsBefore > 0
+            ? Math.round((1 - toolCharsAfter / toolCharsBefore) * 1000) / 10
+            : 0,
+        },
         limit: opts.limit ?? null,
         importedAt: new Date().toISOString(),
       },
