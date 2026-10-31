@@ -387,6 +387,11 @@ export function transformRow(row: LettaRow, policy: PayloadPolicy = FULL_PAYLOAD
 function participantFor(row: LettaRow, opts: Opts): string {
   const role = row.message?.role;
   if (role === 'assistant') return opts.agentName;
+  // Tool output is not the user speaking. In 'none' mode these rows are plain
+  // text, so there is no protocol reason to attribute them to the human — and
+  // leaving them under the user's name puts words in their mouth at scale
+  // (Cassie's catch: 106 of 109 'dagr' rows in her slice were tool lines).
+  if (role === 'toolResult' && opts.toolPayload === 'none') return 'tool';
   return opts.userName;
 }
 
