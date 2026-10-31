@@ -382,7 +382,18 @@ async function main() {
     );
     process.exit(3);
   }
-  if (storedTarget === null && initialStats.chunksCompressed === 0 && opts.targetChunkTokens !== null) {
+  // A missing marker on an already-chunked store is UNKNOWN provenance, not
+  // permission to assert the requested value. Writing the request here would
+  // record intent as effect and hide a real mismatch (Cassie's catch).
+  if (storedTarget === null && initialStats.totalChunks > 0 && opts.targetChunkTokens !== null) {
+    console.error(
+      `Refusing to warm: this store already has ${initialStats.totalChunks} chunks but no recorded ` +
+      `chunk target, so --target-chunk-tokens ${opts.targetChunkTokens} cannot be verified as the size ` +
+      `they were created at. Write the marker at import time, or re-import.`,
+    );
+    process.exit(3);
+  }
+  if (storedTarget === null && initialStats.totalChunks === 0 && opts.targetChunkTokens !== null) {
     writeTargetMarker(targetMarkerPath, opts.targetChunkTokens);
   }
   const totalMessages = cm.getAllMessages().length;

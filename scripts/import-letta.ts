@@ -495,6 +495,16 @@ async function main(): Promise<void> {
     store.close?.();
   }
 
+  // Record the chunking THIS import actually applied. Only the component that
+  // set the boundaries can honestly write this: a warmup can only observe that
+  // chunks exist, never what size they were made at.
+  if (opts.targetChunkTokens !== null) {
+    writeFileSync(
+      join(outStorePath, '..', `${meta.id}.chunk-target.json`),
+      JSON.stringify({ targetChunkTokens: opts.targetChunkTokens }) + '\n',
+    );
+  }
+
   const sidecarPath = join(outStorePath, '..', `${meta.id}.import-source.json`);
   writeFileSync(
     sidecarPath,
