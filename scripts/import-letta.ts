@@ -79,7 +79,7 @@ interface Opts {
    *  while actual prose is 17%. 'stub' keeps the shape of the work (which tool,
    *  ok or error, how much came back) and drops the payload; 'cap' truncates;
    *  'full' keeps everything. */
-  toolPayload: 'stub' | 'cap' | 'full';
+  toolPayload: 'none' | 'stub' | 'cap' | 'full';
   /** Chunk target for the strategy opened at import time. Warmup's cost scales
    *  with chunk COUNT, so the size chosen here is the size the whole history
    *  gets remembered at. Null = leave the store unchunked for a later open. */
@@ -100,7 +100,7 @@ function usage(): never {
       '  --out <dir>           DATA_DIR for the chronicle (default: $DATA_DIR or ./data)',
       '  --session-name <name> session title (default: derived from the source dir)',
       '  --limit <n>           import at most n path messages (for rehearsals)',
-      '  --tool-payload <mode>      stub (default) | cap | full — how much tool',
+      '  --tool-payload <mode>      stub (default) | none | cap | full — how much tool',
       '                     output to keep. Results are 43% of a real history by',
       '                     volume and inputs 20%, against 17% of actual prose.',
       '  --target-chunk-tokens <n>  chunk size for the strategy opened here',
@@ -124,8 +124,8 @@ function parseArgs(argv: string[]): Opts {
   // An unrecognised value must fail loudly: silently falling back to 'stub'
   // would run a mode the operator did not choose (and, for 'full', silently
   // discard the receipts they explicitly asked for).
-  if (!['stub', 'cap', 'full'].includes(payloadRaw)) {
-    console.error(`--tool-payload must be one of: stub, cap, full (got ${JSON.stringify(payloadRaw)})`);
+  if (!['none', 'stub', 'cap', 'full'].includes(payloadRaw)) {
+    console.error(`--tool-payload must be one of: none, stub, cap, full (got ${JSON.stringify(payloadRaw)})`);
     process.exit(2);
   }
   return {
@@ -274,7 +274,7 @@ export interface TransformResult {
  * than the splitting the claude.ai importer needs.
  */
 export interface PayloadPolicy {
-  mode: 'stub' | 'cap' | 'full';
+  mode: 'none' | 'stub' | 'cap' | 'full';
   /** Characters kept per tool result / tool input when mode is 'cap'. */
   cap?: number;
 }
@@ -303,6 +303,15 @@ export function transformRow(row: LettaRow, policy: PayloadPolicy = FULL_PAYLOAD
     const toolUseId = body.toolCallId ?? '';
     if (!toolUseId) return { blocks: [], omitted: ['tool_result_without_call_id'] };
     const before = blockText(content);
+    if (policy.mode === 'none') {
+      const note = `[tool result: ${body.toolName ?? 'tool'}, ${before.length} chars, ${body.isError ? 'error' : 'ok'}]`;
+      return {
+        blocks: [{ type: 'text', text: note }],
+        omitted,
+        toolCharsBefore: before.length,
+        toolCharsAfter: note.length,
+      };
+    }
     const after = shorten(before, policy, 'result', body.toolName ?? 'tool', body.isError === true);
     return {
       blocks: [
@@ -348,6 +357,13 @@ export function transformRow(row: LettaRow, policy: PayloadPolicy = FULL_PAYLOAD
         // Tool inputs carry real authored text (a memory edit, a written
         // journal), so 'stub' compresses them rather than deleting them.
         const args = JSON.stringify(call.arguments ?? {});
+        if (policy.mode === 'none') {
+          const note = `[called ${call.name}: ${args.slice(0, 200)}${args.length > 200 ? '…' : ''}]`;
+          blocks.push({ type: 'text', text: note });
+          toolBefore += args.length;
+          toolAfter += note.length;
+          break;
+        }
         const kept = policy.mode === 'full' ? call.arguments ?? {}
           : { _imported: shorten(args, { ...policy, mode: policy.mode === 'stub' ? 'cap' : policy.mode, cap: policy.cap ?? 500 }, 'input', call.name) };
         blocks.push({
